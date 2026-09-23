@@ -1,0 +1,23 @@
+# personal project data — never commit real videos/projects
+library/
+inbox/
+config.json
+reference/
+
+# render caches and generated output
+work/
+work_draft/
+*.mp4
+*.mov
+
+# python
+__pycache__/
+*.pyc
+
+# macOS / editor cruft
+.DS_Store
+.Rhistory
+
+# secrets, just in case
+.env
+*.env
