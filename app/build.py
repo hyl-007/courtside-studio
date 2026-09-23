@@ -44,7 +44,7 @@ WORDS = [w for w in TRANSCRIPT["words"] if w.get("type") == "word" and w.get("st
 # ------------------------------------------------------------------ project (edit decisions live in project.json)
 PROJECT_PATH = Path(os.environ.get("ZBA_PROJECT") or (PDIR / "project.json"))
 PROJECT = json.loads(PROJECT_PATH.read_text())
-BUILD_REV = "20"          # bump when rendering code changes; forces every segment to re-render
+BUILD_REV = "21"          # bump when rendering code changes; forces every segment to re-render
 FORCE = "--force" in sys.argv
 
 
@@ -428,17 +428,24 @@ def build_intense_ass(a1, n, path, fzs=None):
         # real length got collapsed) would otherwise have its card end before that animation is even visible.
         last_pop_s = max(0.0, warp(ws[last]["start"] - a1) - t0o)
         anim_floor = t0o + last_pop_s + 0.35
+        # a short caption (as few as one word — "Hopping.") wants at least caption_min on screen, same as any
+        # other, but the very same nxt clamp that protects a deliberately-extended caption from ever growing
+        # (see below) was silently cutting a SHORT one down to almost nothing whenever the next caption happened
+        # to be scheduled soon after — "Hopping." was getting 0.7s on screen instead of the 1.6s caption_min
+        # actually asks for, which is exactly the "still feels rushed" a longer caption_min is supposed to fix.
+        reading_floor = t0o + _reading_hold(read_words, HOLD) + (0.15 if burst else 0.0)
         # an explicit tail (you dragged this caption's end, or it has a caption_timing override) is honoured as-is —
         # it is never clamped to "before the next caption starts", because that clamp is exactly what was silently
         # cutting a deliberately extended caption back down. Only the automatic (un-overridden) hold is clamped that way.
-        # anim_floor ONLY applies to that automatic case too, for the same reason it skips the nxt clamp above: it's
-        # a safety net for captions nobody has looked at, not a license to override a tail someone set on purpose
-        # (even a short one) — doing that once already caused a real bug, a pyramid whose explicit short tail got
-        # silently extended anyway, bleeding into and visually colliding with the next caption. It's also capped at
-        # a small maximum overlap with the NEXT caption (0.15s) rather than the full amount it would ideally want —
-        # letting it push out as far as it likes once caused two full multi-line cards to sit on screen together
-        # for over a third of a second, which reads worse than the word it was protecting reading a little dim.
-        end = (max(min(max(warp(ws[last]["end"] - a1) + TAIL + (0.15 if len(ch["lines"]) > 1 else 0.0), t0o + _reading_hold(read_words, HOLD) + (0.15 if burst else 0.0)), nxt - 0.02), min(anim_floor, nxt + 0.15))
+        # anim_floor and reading_floor ONLY apply to that automatic case too, for the same reason they skip the nxt
+        # clamp above: they're a safety net for captions nobody has looked at, not a license to override a tail
+        # someone set on purpose (even a short one) — doing that once already caused a real bug, a pyramid whose
+        # explicit short tail got silently extended anyway, bleeding into and visually colliding with the next
+        # caption. Both are also capped at a small maximum overlap with the NEXT caption (0.15s) rather than the
+        # full amount either would ideally want — letting one push out as far as it likes once caused two full
+        # multi-line cards to sit on screen together for over a third of a second, which reads worse than the
+        # word it was protecting reading a little dim (or, here, a little short of the full caption_min).
+        end = (max(min(max(warp(ws[last]["end"] - a1) + TAIL + (0.15 if len(ch["lines"]) > 1 else 0.0), reading_floor), nxt - 0.02), min(max(anim_floor, reading_floor), nxt + 0.15))
                if tov is None else max(warp(ws[last]["end"] - a1) + float(tov), t0o + 0.3))
         rows = []
         for li, idxs in enumerate(ch["lines"]):

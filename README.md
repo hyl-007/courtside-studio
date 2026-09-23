@@ -43,7 +43,26 @@ Replace `brand/logo.png` with your own watermark (any PNG works) — the render 
 
 ## Using the Claude assistant
 
-The browser editor has a "✦ Claude" panel that runs a separate `claude -p` process, restricted to one command at a time via `app/zba_cli.py`, editing the same `project.json` you see live in the timeline. It needs the `claude` CLI installed and on your `PATH`.
+The browser editor has a "✦ Claude" panel that runs a separate `claude -p` process, restricted to one command at a time via `app/zba_cli.py`, editing the same `project.json` you see live in the timeline. It needs the `claude` CLI installed and on your `PATH`. This panel is deliberately sandboxed — it can only call the whitelisted commands in `zba_cli.py` (read the project, patch captions, move a segment, run a preview render, etc.), so it's safe to leave running while you watch the timeline update, but it won't touch anything outside a project's own files.
+
+## Connecting your own AI agent
+
+For deeper work — debugging the render pipeline itself, adding a feature, chasing a subtle caption-timing bug — point a full coding agent (Claude Code, or any agent that can run shell commands and edit files) at this folder directly, instead of going through the sandboxed in-browser panel:
+
+```bash
+cd courtside-studio
+claude
+```
+
+There's nothing special to authenticate — `build.py` and `server.py` are just local Python processes reading/writing files under `library/<slug>/`. An agent working in this folder can:
+
+- Read/edit `library/<slug>/project.json` directly (it's plain JSON — segments, captions, freeze frames, settings).
+- Or drive it through `app/zba_cli.py`, the same CLI the in-browser assistant uses — run `python3 zba_cli.py --help` (from `app/`, with `ZBA_PDIR=<path to a project folder>` set) to see every command: `outline`, `project`, `changes`, `transcript`, `find`, `media`, `patch`, `caption`, `preview`, `set`, `word`, `unword`, `delseg`, `moveseg`, `qa`, `beats`.
+- Render with `python3 build.py` (or the `preview` command, which renders and polls until done) and verify the result with `ffprobe` (check duration/size) and `ffmpeg -v error -i out.mp4 -f null -` (must exit with no output) before calling anything done.
+
+**Give the agent the skill file first.** Copy `.claude/skills/hyl-studio-video-editing/` into your own `~/.claude/skills/` (or point the agent at it directly) — it documents the caption-timing architecture, the animation/reading-time floors, `BUILD_REV` cache invalidation, and the render-verification habits that aren't obvious from reading `build.py` cold. Most of the non-obvious bugs in this codebase come from the same handful of interacting timing rules; the skill exists so an agent doesn't have to rediscover them the hard way.
+
+If you want your agent's edits to show up live in the browser timeline the same way the built-in panel's do, just have it edit the same `project.json` the server is already watching — no extra wiring needed, the browser polls the file for changes.
 
 ## Notes
 
