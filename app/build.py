@@ -44,7 +44,7 @@ WORDS = [w for w in TRANSCRIPT["words"] if w.get("type") == "word" and w.get("st
 # ------------------------------------------------------------------ project (edit decisions live in project.json)
 PROJECT_PATH = Path(os.environ.get("ZBA_PROJECT") or (PDIR / "project.json"))
 PROJECT = json.loads(PROJECT_PATH.read_text())
-BUILD_REV = "21"          # bump when rendering code changes; forces every segment to re-render
+BUILD_REV = "26"          # bump when rendering code changes; forces every segment to re-render
 FORCE = "--force" in sys.argv
 
 
@@ -64,6 +64,13 @@ SETTINGS = {**DEFAULT_SETTINGS, **PROJECT.get("settings", {})}     # normalized,
 # W/H must be set before anything below computes a canvas-relative default (fonts, drawing helpers); FPS must be set
 # before any duration is turned into a frame count — so this has to happen right after SETTINGS, not at import time.
 W, H, FPS = int(SETTINGS.get("export_w", 1080)), int(SETTINGS.get("export_h", 1920)), int(SETTINGS.get("export_fps", 30))
+# freeze-frame annotations (pts/stamp) are always authored on a fixed 1080x1920 reference canvas — the browser's
+# annotation editor scales screen pixels by stageWidth/1080 regardless of the project's own export size, so the
+# numbers stored in project.json never know about export_w/export_h. This scales that fixed reference into
+# whatever the current export resolution actually is, the same way the ASS caption track's own fixed PlayResX/Y
+# already gets scaled by the output frame size.
+ANNO_REF_W, ANNO_REF_H = 1080.0, 1920.0
+ANNO_SCALE = W / ANNO_REF_W
 sys.path.insert(0, str(Path.home() / "Developer" / "video-use" / "helpers"))
 try:
     from grade import PRESETS as GRADE_PRESETS      # video-use's own presets
@@ -332,6 +339,24 @@ def build_intense_ass(a1, n, path, fzs=None):
     ws = apply_edits(ws)
     ws = [w for w in ws if clean_word(w["text"]) not in {"UH", "UM", "AH", "EH", "ERM"}]
     ws = [w for i, w in enumerate(ws) if not (i + 1 < len(ws) and _tok(w["text"]) in STOP_WORDS and _tok(w["text"]) == _tok(ws[i + 1]["text"]))]
+    # a word typed as several words in one slot (cramming extra text into one original ASR word, then hiding the
+    # rest) used to render as one oversized "word" here — its FULL crammed string sized as a single token threw off
+    # both the line-wrap width math and the per-word pop-in, so it looked like a wall of text that just appeared
+    # with no animation and the wrong size/position. build_ass already splits this back into its own words for its
+    # highlight sweep; same fix here, splitting the slot's time budget evenly so each piece still pops in on its
+    # own beat and sizes/wraps correctly.
+    ws2 = []
+    for w in ws:
+        toks = str(w["text"]).split()
+        if len(toks) <= 1:
+            ws2.append(w); continue
+        dur = max(0.04, w["end"] - w["start"]); share = dur / len(toks)
+        for j, tok in enumerate(toks):
+            nw = dict(w, text=tok, start=w["start"] + j * share, end=w["end"] if j == len(toks) - 1 else w["start"] + (j + 1) * share)
+            if j > 0:
+                nw["_split"] = True     # a synthesized piece of a crammed edit, not a real transcript slot — see the swallow-guard below
+            ws2.append(nw)
+    ws = ws2
     if not ws:
         Path(path).write_text(ASS_HEAD + "\n"); return 0
     runs = {i: (g, reps) for i, g, reps in _runs(ws)}
@@ -353,6 +378,15 @@ def build_intense_ass(a1, n, path, fzs=None):
             seg.append(idx); cw2 += wd
         ls.append(seg)
         chunks.append(dict(lines=ls, rank=[0] * len(ls)))
+
+    def _lines_needed(idxs):                                              # same greedy width math as flush(), just counting lines instead of building them —
+        cw2, n = 0.0, 1                                                   # used to break BEFORE a caption would grow into a 3rd (hard-to-read) line
+        for idx in idxs:
+            wd = len(clean_word(ws[idx]["text"])) * 0.5 * base * (100 + lb(idx) * 100) / 100 + 0.3 * base
+            if cw2 and cw2 + wd > 930:
+                n += 1; cw2 = 0.0
+            cw2 += wd
+        return n
     while i < len(ws):
         if i in runs:
             if cur: flush(); cur = []
@@ -360,7 +394,12 @@ def build_intense_ass(a1, n, path, fzs=None):
             chunks.append(dict(lines=[list(range(i + r * g, i + (r + 1) * g)) for r in range(reps)], rank=list(range(reps)), pyramid=True))
             i += g * reps; continue
         w = ws[i]; wk = _wms(w)
-        if cur and (wk in CAPTION_BREAKS or (wk not in CAPTION_JOINS and (w["start"] - ws[cur[-1]]["end"] > 0.6 or len(cur) >= MAXW))):
+        # a long unbroken explanation (no punctuation, no real pause) chunked purely by pause/punctuation can grow
+        # past what fits on 2 lines before it hits one — reading a 3-line kinetic caption is what this guards
+        # against, breaking right before the word that would force a 3rd line rather than waiting for a pause
+        # that might be a while coming.
+        wraps3 = cur and _lines_needed(cur + [i]) > 2
+        if cur and (wk in CAPTION_BREAKS or wraps3 or (wk not in CAPTION_JOINS and (w["start"] - ws[cur[-1]]["end"] > 0.6 or len(cur) >= MAXW))):
             flush(); cur = []
         cur.append(i)
         # the raw-sentence-end fallback only stands in for a word that was HIDDEN (edited to nothing) — one edited
@@ -377,18 +416,19 @@ def build_intense_ass(a1, n, path, fzs=None):
     # sanity check, not a hard failure: if a card contains a real sentence-ending word that ISN'T its last word,
     # AND at least one word after it is still the original, untouched transcript text, a later sentence almost
     # certainly got swallowed into this card by accident (the exact failure this file was rewritten to prevent —
-    # see RAW_SENT_END above). Two things deliberately do NOT count as a swallow, and are excluded so this stays
-    # quiet in the normal case: a repeat pyramid (each repeat naturally ends its own "sentence" by design), and a
+    # see RAW_SENT_END above). Three things deliberately do NOT count as a swallow, and are excluded so this stays
+    # quiet in the normal case: a repeat pyramid (each repeat naturally ends its own "sentence" by design), a
     # card where every later word was hand-edited too (you rebuilt one sentence out of several ASR slots on
-    # purpose — a leftover raw period in the middle of that isn't a mistake). Printed so it shows up in the render
-    # log instead of only being noticed after the video is posted.
+    # purpose — a leftover raw period in the middle of that isn't a mistake), and a synthesized piece of a crammed
+    # multi-word edit (`_split`) — it has no CAPTION_EDITS key of its own to match, but it's still edited text by
+    # construction. Printed so it shows up in the render log instead of only being noticed after the video is posted.
     for ch in chunks:
         if ch.get("pyramid"):
             continue
         flat = [idx for l in ch["lines"] for idx in l]
         for pos, idx in enumerate(flat[:-1]):
             later = flat[pos + 1:]
-            if _wms(ws[idx]) in RAW_SENT_END and any(str(_wms(ws[j])) not in CAPTION_EDITS for j in later):
+            if _wms(ws[idx]) in RAW_SENT_END and any(str(_wms(ws[j])) not in CAPTION_EDITS and not ws[j].get("_split") for j in later):
                 print(f"WARN cap: card starting {ws[flat[0]]['start']:.2f}s may have swallowed a later sentence "
                       f"(sentence-end at {ws[idx]['start']:.2f}s isn't the card's last word, and unedited words follow it) "
                       f"— double-check it", file=sys.stderr)
@@ -426,27 +466,32 @@ def build_intense_ass(a1, n, path, fzs=None):
         # the last word's own pop-in plays out over ~200ms starting when IT is spoken, not when the chunk began —
         # a word whose recorded duration is tiny or zero (a bad ASR timestamp, or the final word of a run whose
         # real length got collapsed) would otherwise have its card end before that animation is even visible.
+        # Used to demand a fixed 0.35s no matter what, then let `end` overshoot into the next caption's start to
+        # make room for it — fine when rare, but a forced word-count chunk boundary (no real pause under it) can
+        # land the last word right up against the next caption's own start, and this fired on nearly EVERY such
+        # boundary, not just the odd one. Same fix already proven for repeat pyramids (`pyramid_anim_ms` below):
+        # shrink the animation itself to fit the real gap instead of pushing the card's end past it.
+        last_ms = max(0, int((ws[last]["start"] - leads[ci] - t0) * 1000))
+        nxt_ms_rel = int(round((nxt - t0o) * 1000)) if nxt < 1e9 else last_ms + 260
+        last_word_ad = max(40, min(200, nxt_ms_rel - last_ms - 15))
         last_pop_s = max(0.0, warp(ws[last]["start"] - a1) - t0o)
-        anim_floor = t0o + last_pop_s + 0.35
+        anim_floor = t0o + last_pop_s + last_word_ad / 1000.0 + 0.05
         # a short caption (as few as one word — "Hopping.") wants at least caption_min on screen, same as any
-        # other, but the very same nxt clamp that protects a deliberately-extended caption from ever growing
-        # (see below) was silently cutting a SHORT one down to almost nothing whenever the next caption happened
-        # to be scheduled soon after — "Hopping." was getting 0.7s on screen instead of the 1.6s caption_min
-        # actually asks for, which is exactly the "still feels rushed" a longer caption_min is supposed to fix.
+        # other — this is the TARGET a caption's hold time reaches for.
         reading_floor = t0o + _reading_hold(read_words, HOLD) + (0.15 if burst else 0.0)
-        # an explicit tail (you dragged this caption's end, or it has a caption_timing override) is honoured as-is —
-        # it is never clamped to "before the next caption starts", because that clamp is exactly what was silently
-        # cutting a deliberately extended caption back down. Only the automatic (un-overridden) hold is clamped that way.
-        # anim_floor and reading_floor ONLY apply to that automatic case too, for the same reason they skip the nxt
-        # clamp above: they're a safety net for captions nobody has looked at, not a license to override a tail
-        # someone set on purpose (even a short one) — doing that once already caused a real bug, a pyramid whose
-        # explicit short tail got silently extended anyway, bleeding into and visually colliding with the next
-        # caption. Both are also capped at a small maximum overlap with the NEXT caption (0.15s) rather than the
-        # full amount either would ideally want — letting one push out as far as it likes once caused two full
-        # multi-line cards to sit on screen together for over a third of a second, which reads worse than the
-        # word it was protecting reading a little dim (or, here, a little short of the full caption_min).
-        end = (max(min(max(warp(ws[last]["end"] - a1) + TAIL + (0.15 if len(ch["lines"]) > 1 else 0.0), reading_floor), nxt - 0.02), min(max(anim_floor, reading_floor), nxt + 0.15))
-               if tov is None else max(warp(ws[last]["end"] - a1) + float(tov), t0o + 0.3))
+        # every caption — automatic OR an explicit caption_timing override — is now hard-clamped to end strictly
+        # before the next one starts. This used to let a caption push a little past `nxt` (up to 0.15s) when
+        # `anim_floor`/`reading_floor` couldn't otherwise be met, on the reasoning that a brief overlap reads
+        # better than an invisible word or a too-short hold. In practice any non-zero overlap — even that small,
+        # deliberately-capped amount — read as "captions still overlapping" to a real viewer, repeatedly, no
+        # matter how the cap was tuned. So there is no overshoot allowance left at all: `anim_floor`/`reading_floor`
+        # still pull a caption's target hold time UP as high as they can, they just can never push it PAST `nxt`
+        # any more. A caption that can't fully reach its ideal hold time (or whose last word's pop-in animation
+        # doesn't have room to fully play) settles for what fits instead of ever touching the next card — losing
+        # a little polish on a rare tight caption is a smaller cost than any overlap, ever.
+        auto_end = max(warp(ws[last]["end"] - a1) + TAIL + (0.15 if len(ch["lines"]) > 1 else 0.0), reading_floor, anim_floor)
+        end = (min(auto_end, nxt - 0.02) if tov is None
+               else min(max(warp(ws[last]["end"] - a1) + float(tov), t0o + 0.3), nxt - 0.02))
         rows = []
         for li, idxs in enumerate(ch["lines"]):
             r = ch["rank"][li]; pyramid = ch.get("pyramid", False)
@@ -463,7 +508,7 @@ def build_intense_ass(a1, n, path, fzs=None):
             for i, sz in zip(idxs, sizes):
                 S = sz * k; ms = (idxs.index(i) * 70) if burst else max(0, int((ws[i]["start"] - leads[ci] - t0) * 1000)); col = ass_bgr(_hot(r, S))
                 rot = f"\\frz{tilt:.1f}" if tilt else ""
-                ad = pyramid_anim_ms.get(i, 200)          # this word's own pop-in/settle length — shorter only if the next word is due very soon
+                ad = pyramid_anim_ms.get(i, last_word_ad if i == last else 200)  # this word's own pop-in/settle length — shorter only if the next word (or next caption, for the last word) is due very soon
                 ov_end = round(ad * 0.55)
                 tags = (f"{{\\alpha&HFF&\\1c{col}\\bord{max(6.0, 9 * S / 100 * 0.9):.1f}{rot}\\fscx{S * pop_from:.0f}\\fscy{S * pop_from:.0f}"
                         f"\\t({ms},{ms + 1},\\alpha&H00&)\\t({ms},{ms + ov_end},\\fscx{S * overshoot:.0f}\\fscy{S * overshoot:.0f})\\t({ms + ov_end},{ms + ad},\\fscx{S:.0f}\\fscy{S:.0f})}}")
@@ -544,9 +589,11 @@ def build_ass(a1, n, path, shift=0.0, fzs=None):
     GOLD = ass_bgr(SETTINGS.get("caption_highlight", "#f8c880"))
     for i, ch in enumerate(chunks):                                    # readable: on screen before he says it, and it stays a moment after
         st = sts[i]; nxt = sts[i + 1] if i + 1 < len(chunks) else 1e9; tov = _ct(_wms(ch[0]))[1]
-        # an explicit tail override is honoured as-is, never clamped to "before the next caption" — see build_intense_ass for why
+        # every caption is hard-clamped to end strictly before the next one starts, explicit override or not —
+        # see build_intense_ass for the fuller reasoning (a caption's hold time settles for what fits rather
+        # than ever touching the next card, no exceptions).
         en = (min(max(warp(ch[-1]["end"] - a1) + TAIL, st + _reading_hold(len(ch), HOLD)), nxt - 0.02)
-              if tov is None else max(warp(ch[-1]["end"] - a1) + float(tov), st + 0.3))
+              if tov is None else min(max(warp(ch[-1]["end"] - a1) + float(tov), st + 0.3), nxt - 0.02))
         lead_cs = max(0, int(round((warp(ch[0]["start"] - a1) - st) * 100)))
         # every word gets its OWN white->highlight fade, timed to when it is actually spoken. A word you edited into
         # several words (typed extra text into one slot) is split back into its own words here, sharing that one
@@ -697,9 +744,14 @@ def draw_stamp(frame, spec, tnow):
 
 @lru_cache(None)
 def _spot(key, still_path):
+    # built at the STILL's own native resolution (== the 1080x1920 annotation reference, for every project with
+    # freeze frames today — see ANNO_SCALE above), not the export W/H: this mask multiplies directly against the
+    # native-resolution still, before that still is resized up/down to the actual export canvas.
     ann = ANN[key]
-    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
-    m = np.zeros((H, W), np.float32)
+    with Image.open(still_path) as im:
+        Wn, Hn = im.size
+    yy, xx = np.mgrid[0:Hn, 0:Wn].astype(np.float32)
+    m = np.zeros((Hn, Wn), np.float32)
     for p in ann["pts"]:
         cx, cy = p["c"]; rx, ry = p["r"]
         g = np.exp(-(((xx - cx) / (rx * 1.9)) ** 2 + ((yy - cy) / (ry * 1.9)) ** 2))
@@ -711,17 +763,23 @@ def freeze_frame(args):
     key, still_path, i, n, out_dir = args
     ann = ANN[key]; t = i / FPS; T = n / FPS
     base = np.asarray(Image.open(still_path).convert("RGB"), dtype=np.float32)
+    Hn, Wn = base.shape[:2]                                    # the still's own native pixel size — the crop below
+                                                                # is applied to THIS image, not the export canvas
     dim = 0.46 * ease_out((t - 0.04) / 0.30)
     m = _spot(key, still_path)
     shade = 1 - dim * (1 - m)
     img = Image.fromarray(np.clip(base * shade[..., None], 0, 255).astype(np.uint8))
     zoom = 1 + 0.05 * ease_out(t / max(T, 0.1))
-    fx = float(np.mean([p["c"][0] for p in ann["pts"]])) / W
-    fy = float(np.mean([p["c"][1] for p in ann["pts"]])) / H
-    cw, ch = W / zoom, H / zoom
-    x0 = (W - cw) * fx; y0 = (H - ch) * fy
+    # fx/fy are the FRACTIONAL zoom-in center (0..1), read off the 1080x1920 annotation reference regardless of
+    # either the still's native size or the export size; the crop box itself is then sized/positioned against the
+    # still's OWN native dimensions, since that's the image actually being cropped.
+    fx = float(np.mean([p["c"][0] for p in ann["pts"]])) / ANNO_REF_W
+    fy = float(np.mean([p["c"][1] for p in ann["pts"]])) / ANNO_REF_H
+    cw, ch = Wn / zoom, Hn / zoom
+    x0 = (Wn - cw) * fx; y0 = (Hn - ch) * fy
     img = img.resize((W, H), Image.BICUBIC, box=(x0, y0, x0 + cw, y0 + ch))
-    frame = img.convert("RGBA")
+    frame = img.convert("RGBA")                                # `frame` is now genuinely at the export (W,H) —
+                                                                 # everything drawn below must be in THAT space
 
     # viewfinder corners + breakdown chip
     fa = ease_out((t - 0.05) / 0.2)
@@ -732,29 +790,33 @@ def freeze_frame(args):
             d.line([(x, y + dy * L), (x, y), (x + dx * L, y)], fill=GOLD + (255,), width=wd, joint="curve")
     aa_paste(frame, (0, 0, W, H), corners, alpha=fa * 0.9, ss=1)
     if t > 0.10:
-        draw_pill(frame, (540, 250), "COACH BREAKDOWN", GOLD, 0.62 + 0.38 * ease_back((t - 0.1) / 0.25), min(1, (t - 0.1) / 0.15), size=46)
+        draw_pill(frame, (540 * ANNO_SCALE, 250 * ANNO_SCALE), "COACH BREAKDOWN", GOLD, 0.62 + 0.38 * ease_back((t - 0.1) / 0.25), min(1, (t - 0.1) / 0.15), size=46 * ANNO_SCALE)
 
     for k, p in enumerate(ann["pts"]):
         tp = t - p["t0"]
         if tp < 0:
             continue
         prog = ease_out(tp / 0.30)
-        draw_ring(frame, p["c"], p["r"], p["color"], prog, tp)
+        c = (p["c"][0] * ANNO_SCALE, p["c"][1] * ANNO_SCALE)
+        r = (p["r"][0] * ANNO_SCALE, p["r"][1] * ANNO_SCALE)
+        draw_ring(frame, c, r, p["color"], prog, tp, width=max(1, round(9 * ANNO_SCALE)))
         # connector from ring edge toward the label
-        lx, ly = p["lab"]; cx, cy = p["c"]
+        lx, ly = p["lab"][0] * ANNO_SCALE, p["lab"][1] * ANNO_SCALE; cx, cy = c
         dx, dy = lx - cx, ly - cy; dist = math.hypot(dx, dy) or 1.0
         ux, uy = dx / dist, dy / dist
-        rr = (p["r"][0] * p["r"][1]) / math.hypot(p["r"][1] * ux, p["r"][0] * uy)
+        rr = (r[0] * r[1]) / math.hypot(r[1] * ux, r[0] * uy)
         p0 = (cx + ux * (rr + 8), cy + uy * (rr + 8))
         p1 = (lx - ux * 26, ly - uy * 26)
         lp = ease_out((tp - 0.22) / 0.20)
         if lp > 0:
-            draw_line(frame, p0, p1, p["color"], lp)
+            draw_line(frame, p0, p1, p["color"], lp, width=max(1, round(7 * ANNO_SCALE)))
         sp = (tp - 0.36) / 0.26
         if sp > 0:
-            draw_pill(frame, (lx, ly), p["text"], p["color"], 0.7 + 0.3 * ease_back(sp), min(1, sp * 2.2), num=k + 1, angle=p.get("angle", 0))
+            draw_pill(frame, (lx, ly), p["text"], p["color"], 0.7 + 0.3 * ease_back(sp), min(1, sp * 2.2), num=k + 1, size=round(56 * ANNO_SCALE), angle=p.get("angle", 0))
     if ann.get("stamp"):
-        draw_stamp(frame, ann["stamp"], t)
+        st = dict(ann["stamp"], xy=(ann["stamp"]["xy"][0] * ANNO_SCALE, ann["stamp"]["xy"][1] * ANNO_SCALE),
+                  scale=ann["stamp"].get("scale", 1.0) * ANNO_SCALE)
+        draw_stamp(frame, st, t)
     fl = max(0.0, 1 - t / 0.13) * 0.85
     if fl > 0:
         frame = Image.blend(frame, Image.new("RGBA", (W, H), (255, 255, 255, 255)), fl)
