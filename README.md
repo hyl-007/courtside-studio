@@ -46,6 +46,8 @@ Replace `brand/logo.png` with your own watermark (any PNG works) — the render 
 
 The browser editor has a "✦ Claude" panel that runs a separate `claude -p` process, restricted to one command at a time via `app/zba_cli.py`, editing the same `project.json` you see live in the timeline. It needs the `claude` CLI installed and on your `PATH`. This panel is deliberately sandboxed — it can only call the whitelisted commands in `zba_cli.py` (read the project, patch captions, move a segment, run a preview render, etc.), so it's safe to leave running while you watch the timeline update, but it won't touch anything outside a project's own files.
 
+*Best is to connect claudecode to the website and let it work on the video rendering and any edits you want, instead of using the chat, since the website is run locally on your computer. Smarter and more accurate if done this way.
+
 ## Connecting your own AI agent
 
 For deeper work — debugging the render pipeline itself, adding a feature, chasing a subtle caption-timing bug — point a full coding agent (Claude Code, or any agent that can run shell commands and edit files) at this folder directly, instead of going through the sandboxed in-browser panel:
