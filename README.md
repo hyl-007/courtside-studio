@@ -1,4 +1,4 @@
-# Courtside Studio
+# Courtside Studio (Prototyping Phase)
 
 A local, CapCut-style vertical-video editor you run on your own Mac and drive by talking to Claude (or by hand, in the browser). Built for cutting fast, highlight/interview-style reels — timeline editing, word-level captions (including a "kinetic" pop-in style for repeated phrases), freeze frames with callout annotations, beat-synced cuts, multi-track picture-in-picture, and an ffmpeg render pipeline underneath.
 
@@ -16,6 +16,7 @@ This started as a tool for a youth basketball academy's social reels, then grew 
 ## Requirements
 
 - macOS (developed and tested there; the ffmpeg/PIL pipeline should port to Linux with minor path changes)
+- *Windows* not tested yet but should be fine, will update in the future
 - Python 3 with `numpy`, `Pillow` (`pip install numpy pillow`)
 - `ffmpeg`/`ffprobe` on your `PATH` (`brew install ffmpeg`)
 - A word-level transcript per source video (this repo doesn't include a transcription step — bring your own, e.g. via ElevenLabs Scribe or Whisper, in the `{"words": [{"type":"word","start":..,"end":..,"text":..}, ...]}` shape `build.py` expects)
